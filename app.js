@@ -1,13 +1,14 @@
 /**
  * PulseSense — Camera-based Heart Rate Monitor
  * 
- * Uses Photoplethysmography (PPG) to detect heart rate from the camera.
- * The red channel intensity fluctuates with each heartbeat as blood volume
- * changes in the fingertip tissue.
+ * Uses Photoplethysmography (PPG) to detect heart rate.
  * 
- * Two BPM detection methods:
- * 1. Peak detection (primary) — finds local maxima in filtered signal
- * 2. Auto-correlation (fallback) — frequency domain analysis for noisy signals
+ * Approach: Simple & robust signal processing
+ * 1. Extract average red channel from camera frames
+ * 2. Detrend using slow moving average subtraction (no IIR filters)
+ * 3. Smooth with fast moving average
+ * 4. Find peaks with adaptive thresholding
+ * 5. Validate periodicity before showing BPM
  */
 
 (function () {
@@ -17,14 +18,15 @@
     // Configuration
     // ============================================
     const CONFIG = {
-        BUFFER_SECONDS: 10,         // Seconds of data to keep
+        BUFFER_SECONDS: 12,
         MIN_BPM: 40,
-        MAX_BPM: 220,
-        STABILIZATION_TIME: 2000,   // ms before attempting BPM
-        MIN_PEAKS_FOR_BPM: 2,      // Minimum peaks needed
-        SMOOTHING_WINDOW: 3,        // Moving average window size
-        QUALITY_THRESHOLD: 0.08,    // Very low threshold — we try to show BPM whenever possible
-        BPM_HISTORY_SIZE: 6,        // Rolling BPM readings to average
+        MAX_BPM: 200,
+        WARMUP_SAMPLES: 60,         // ~2 seconds of data before trying BPM
+        MIN_PEAKS_FOR_BPM: 3,
+        BPM_HISTORY_SIZE: 5,
+        DETREND_WINDOW_SEC: 3,      // Slow moving avg window for DC removal
+        SMOOTH_WINDOW: 5,           // Fast moving avg for noise reduction
+        IBI_CONSISTENCY: 0.40,      // Max allowed coefficient of variation in intervals
     };
 
     // ============================================
@@ -37,12 +39,13 @@
         startTime: 0,
         lastSampleTime: 0,
         sampleCount: 0,
-        measuredFPS: 30,
 
-        // Signal buffers
-        rawSignal: [],
-        filteredSignal: [],
-        timestamps: [],
+        // Raw data
+        rawRed: [],                 // Raw red channel averages
+        timestamps: [],             // performance.now() timestamps
+
+        // Processed
+        detrendedSignal: [],        // After DC removal + smoothing
 
         // Results
         bpmHistory: [],
@@ -53,17 +56,14 @@
         maxBPM: 0,
         lastIBI: 0,
         signalQuality: 0,
-        lastPeakTime: 0,
-        detectionMethod: '',
+        lastBeatTime: 0,
+        fingerDetected: false,
 
-        // Adaptive filter state
-        lpX: [0, 0, 0],
-        lpY: [0, 0, 0],
-        hpX: [0, 0, 0],
-        hpY: [0, 0, 0],
-
-        // DC removal
-        dcEstimate: 0,
+        // Debug
+        debugRedMean: 0,
+        debugRedRatio: 0,
+        debugPeakCount: 0,
+        debugAmplitude: 0,
     };
 
     // ============================================
@@ -97,52 +97,51 @@
     // ============================================
     async function startCamera() {
         try {
-            // Try rear camera first (for phones)
-            let constraints = {
-                video: {
-                    facingMode: { ideal: 'environment' },
-                    width: { ideal: 320 },
-                    height: { ideal: 240 },
-                }
-            };
+            let stream = null;
 
+            // Try rear camera with flash first
             try {
-                state.stream = await navigator.mediaDevices.getUserMedia(constraints);
+                stream = await navigator.mediaDevices.getUserMedia({
+                    video: {
+                        facingMode: { ideal: 'environment' },
+                        width: { ideal: 160 },   // Small res = faster pixel reading
+                        height: { ideal: 120 },
+                    }
+                });
             } catch (e) {
-                // Fallback to any camera (laptops)
-                constraints = { video: { width: { ideal: 320 }, height: { ideal: 240 } } };
-                state.stream = await navigator.mediaDevices.getUserMedia(constraints);
+                // Fallback: any camera
+                stream = await navigator.mediaDevices.getUserMedia({
+                    video: { width: { ideal: 160 }, height: { ideal: 120 } }
+                });
             }
 
-            DOM.video.srcObject = state.stream;
+            state.stream = stream;
+            DOM.video.srcObject = stream;
 
-            await new Promise((resolve) => {
-                DOM.video.onloadedmetadata = () => {
-                    DOM.video.play();
-                    resolve();
-                };
+            await new Promise(resolve => {
+                DOM.video.onloadedmetadata = () => { DOM.video.play(); resolve(); };
             });
 
-            // Try to enable torch/flash
-            const track = state.stream.getVideoTracks()[0];
+            // Enable torch if available
+            const track = stream.getVideoTracks()[0];
             try {
-                const capabilities = track.getCapabilities ? track.getCapabilities() : {};
-                if (capabilities.torch) {
+                const caps = track.getCapabilities ? track.getCapabilities() : {};
+                if (caps.torch) {
                     await track.applyConstraints({ advanced: [{ torch: true }] });
-                    console.log('Torch enabled');
+                    console.log('[PulseSense] Torch ON');
                 }
             } catch (e) {
-                console.log('Torch not available');
+                console.log('[PulseSense] No torch available');
             }
 
-            // Set canvas size
-            DOM.canvas.width = DOM.video.videoWidth || 320;
-            DOM.canvas.height = DOM.video.videoHeight || 240;
+            DOM.canvas.width = DOM.video.videoWidth || 160;
+            DOM.canvas.height = DOM.video.videoHeight || 120;
 
+            console.log(`[PulseSense] Camera: ${DOM.canvas.width}x${DOM.canvas.height}`);
             return true;
         } catch (err) {
-            console.error('Camera error:', err);
-            alert('Camera access denied. Please allow camera permissions and reload.');
+            console.error('[PulseSense] Camera error:', err);
+            alert('Camera access denied. Please allow camera permissions and try again.');
             return false;
         }
     }
@@ -158,199 +157,191 @@
     // ============================================
     // Signal Extraction
     // ============================================
-    function extractChannels() {
-        if (!DOM.canvas.width || !DOM.canvas.height) return { red: 0, green: 0, blue: 0 };
-
-        ctx.drawImage(DOM.video, 0, 0, DOM.canvas.width, DOM.canvas.height);
-        const imageData = ctx.getImageData(0, 0, DOM.canvas.width, DOM.canvas.height);
-        const pixels = imageData.data;
-
-        let redSum = 0, greenSum = 0, blueSum = 0, count = 0;
-
+    function sampleRedChannel() {
         const w = DOM.canvas.width;
         const h = DOM.canvas.height;
-        // Sample the center 60% of the frame
-        const x0 = Math.floor(w * 0.2);
-        const x1 = Math.floor(w * 0.8);
-        const y0 = Math.floor(h * 0.2);
-        const y1 = Math.floor(h * 0.8);
+        if (!w || !h) return null;
 
-        // Step by 2 for performance on larger frames
-        const step = w > 200 ? 2 : 1;
+        ctx.drawImage(DOM.video, 0, 0, w, h);
+        const data = ctx.getImageData(0, 0, w, h).data;
 
-        for (let y = y0; y < y1; y += step) {
-            for (let x = x0; x < x1; x += step) {
+        let rSum = 0, gSum = 0, bSum = 0, count = 0;
+
+        // Sample center 50% region for best signal
+        const x0 = Math.floor(w * 0.25), x1 = Math.floor(w * 0.75);
+        const y0 = Math.floor(h * 0.25), y1 = Math.floor(h * 0.75);
+
+        for (let y = y0; y < y1; y++) {
+            for (let x = x0; x < x1; x++) {
                 const i = (y * w + x) * 4;
-                redSum += pixels[i];
-                greenSum += pixels[i + 1];
-                blueSum += pixels[i + 2];
+                rSum += data[i];
+                gSum += data[i + 1];
+                bSum += data[i + 2];
                 count++;
             }
         }
 
-        return {
-            red: count > 0 ? redSum / count : 0,
-            green: count > 0 ? greenSum / count : 0,
-            blue: count > 0 ? blueSum / count : 0,
-        };
+        if (count === 0) return null;
+
+        const r = rSum / count;
+        const g = gSum / count;
+        const b = bSum / count;
+        const total = r + g + b;
+
+        state.debugRedMean = r;
+        state.debugRedRatio = total > 0 ? r / total : 0;
+
+        return { red: r, green: g, blue: b };
     }
 
     // ============================================
-    // Signal Quality Assessment
+    // Finger Detection
     // ============================================
-    function assessSignalQuality(channels) {
+    function isFingerOnCamera(channels) {
+        if (!channels) return false;
         const { red, green, blue } = channels;
         const total = red + green + blue;
-        if (total < 1) return 0;
+        if (total < 10) return false;
 
-        let quality = 0;
-
-        // 1. Red dominance (finger with flash: red > 50%)
         const redRatio = red / total;
-        if (redRatio > 0.36) {
-            quality += Math.min(0.4, (redRatio - 0.36) * 2.5);
-        }
-
-        // 2. Brightness (any light source)
         const brightness = total / 3;
-        if (brightness > 10) {
-            quality += Math.min(0.25, brightness / 400);
+
+        // Finger on camera with flash:
+        //   - Red strongly dominates (ratio > 0.4)
+        //   - Brightness is high (> 50)
+        // Finger on camera without flash (laptop):
+        //   - Brightness drops significantly (< 30) because finger blocks light
+        //   - Or red still dominates somewhat
+
+        // Method 1: Red dominance (phone with flash)
+        if (redRatio > 0.4 && brightness > 40) return true;
+
+        // Method 2: Very red image (finger lit by flash)
+        if (red > 100 && redRatio > 0.38) return true;
+
+        // Method 3: Dark image (finger blocking laptop camera)
+        // Check if brightness dropped significantly from initial samples
+        if (state.rawRed.length > 10) {
+            const initialBrightness = state.rawRed.slice(0, 5).reduce((a, b) => a + b, 0) / 5;
+            if (brightness < initialBrightness * 0.5 && brightness < 80) return true;
         }
 
-        // 3. Signal oscillation (the most important indicator)
-        if (state.rawSignal.length > 30) {
-            const recent = state.rawSignal.slice(-60);
-            const mean = recent.reduce((a, b) => a + b, 0) / recent.length;
-            if (mean > 0) {
-                const variance = recent.reduce((a, b) => a + (b - mean) ** 2, 0) / recent.length;
-                const cv = Math.sqrt(variance) / mean;
-                // Even tiny oscillations count — that's the heartbeat
-                quality += Math.min(0.35, cv * 50);
-            }
-        }
-
-        return Math.min(1, quality);
+        return false;
     }
 
     // ============================================
-    // Filtering
+    // Signal Processing (Simple & Robust)
     // ============================================
 
     /**
-     * Simple DC removal using exponential moving average
+     * Detrend signal by subtracting a slow moving average.
+     * This removes DC offset and slow drift, leaving only the AC (pulsatile) component.
      */
-    function removeDC(value) {
-        const alpha = 0.95;
-        state.dcEstimate = alpha * state.dcEstimate + (1 - alpha) * value;
-        return value - state.dcEstimate;
-    }
-
-    /**
-     * 2nd-order IIR Butterworth Bandpass Filter
-     * Dynamically compute coefficients based on measured FPS
-     */
-    function bandpassFilter(value) {
-        const fs = state.measuredFPS || 30;
-
-        // Low-pass at 4.0 Hz (240 BPM max)
-        const fcLP = 4.0;
-        const wLP = Math.tan(Math.PI * fcLP / fs);
-        const wLP2 = wLP * wLP;
-        const kLP = 1 + Math.SQRT2 * wLP + wLP2;
-        const bLP = [wLP2 / kLP, 2 * wLP2 / kLP, wLP2 / kLP];
-        const aLP = [1, 2 * (wLP2 - 1) / kLP, (1 - Math.SQRT2 * wLP + wLP2) / kLP];
-
-        // Apply low-pass
-        state.lpX[2] = state.lpX[1];
-        state.lpX[1] = state.lpX[0];
-        state.lpX[0] = value;
-
-        const lpOut = bLP[0] * state.lpX[0] + bLP[1] * state.lpX[1] + bLP[2] * state.lpX[2]
-            - aLP[1] * state.lpY[1] - aLP[2] * state.lpY[2];
-
-        state.lpY[2] = state.lpY[1];
-        state.lpY[1] = state.lpY[0];
-        state.lpY[0] = isFinite(lpOut) ? lpOut : 0;
-
-        // High-pass at 0.5 Hz (30 BPM min — wider range to catch slow hearts)
-        const fcHP = 0.5;
-        const wHP = Math.tan(Math.PI * fcHP / fs);
-        const wHP2 = wHP * wHP;
-        const kHP = 1 + Math.SQRT2 * wHP + wHP2;
-        const bHP = [1 / kHP, -2 / kHP, 1 / kHP];
-        const aHP = [1, 2 * (wHP2 - 1) / kHP, (1 - Math.SQRT2 * wHP + wHP2) / kHP];
-
-        state.hpX[2] = state.hpX[1];
-        state.hpX[1] = state.hpX[0];
-        state.hpX[0] = state.lpY[0];
-
-        const hpOut = bHP[0] * state.hpX[0] + bHP[1] * state.hpX[1] + bHP[2] * state.hpX[2]
-            - aHP[1] * state.hpY[1] - aHP[2] * state.hpY[2];
-
-        state.hpY[2] = state.hpY[1];
-        state.hpY[1] = state.hpY[0];
-        state.hpY[0] = isFinite(hpOut) ? hpOut : 0;
-
-        return state.hpY[0];
-    }
-
-    /**
-     * Moving average smoothing
-     */
-    function smooth(arr, windowSize) {
-        if (arr.length < windowSize) return [...arr];
-        const result = new Array(arr.length);
-        const half = Math.floor(windowSize / 2);
-        for (let i = 0; i < arr.length; i++) {
-            const s = Math.max(0, i - half);
-            const e = Math.min(arr.length, i + half + 1);
+    function detrend(signal, windowSize) {
+        const result = new Float64Array(signal.length);
+        for (let i = 0; i < signal.length; i++) {
+            const halfWin = Math.floor(windowSize / 2);
+            const start = Math.max(0, i - halfWin);
+            const end = Math.min(signal.length, i + halfWin + 1);
             let sum = 0;
-            for (let j = s; j < e; j++) sum += arr[j];
+            for (let j = start; j < end; j++) sum += signal[j];
+            result[i] = signal[i] - sum / (end - start);
+        }
+        return result;
+    }
+
+    /**
+     * Simple moving average smoothing
+     */
+    function smooth(signal, windowSize) {
+        const result = new Float64Array(signal.length);
+        const half = Math.floor(windowSize / 2);
+        for (let i = 0; i < signal.length; i++) {
+            const s = Math.max(0, i - half);
+            const e = Math.min(signal.length, i + half + 1);
+            let sum = 0;
+            for (let j = s; j < e; j++) sum += signal[j];
             result[i] = sum / (e - s);
         }
         return result;
     }
 
+    /**
+     * Process the raw signal:
+     * 1. Detrend (remove DC with 3-second moving avg)
+     * 2. Smooth (reduce high-frequency noise)
+     */
+    function processSignal() {
+        const fps = getEffectiveFPS();
+        const detrendWindow = Math.max(10, Math.floor(fps * CONFIG.DETREND_WINDOW_SEC));
+
+        // Step 1: Detrend
+        const detrended = detrend(state.rawRed, detrendWindow);
+
+        // Step 2: Smooth
+        const smoothed = smooth(detrended, CONFIG.SMOOTH_WINDOW);
+
+        // Convert to regular array for storage
+        state.detrendedSignal = Array.from(smoothed);
+
+        return smoothed;
+    }
+
     // ============================================
-    // BPM Detection — Method 1: Peak Detection
+    // Peak Detection
     // ============================================
-    function detectPeaks(signal) {
-        if (signal.length < 6) return [];
+    function findPeaks(signal) {
+        if (signal.length < 10) return [];
+
+        const fps = getEffectiveFPS();
+        const minPeakDist = Math.max(4, Math.floor(fps * 60 / CONFIG.MAX_BPM));
+
+        // Compute signal amplitude for thresholding
+        const len = signal.length;
+        const recent = Math.min(len, Math.floor(fps * 4));
+        let maxAmp = 0;
+        for (let i = len - recent; i < len; i++) {
+            const abs = Math.abs(signal[i]);
+            if (abs > maxAmp) maxAmp = abs;
+        }
+
+        // Threshold: 20% of max amplitude (generous to catch weak beats)
+        const threshold = maxAmp * 0.2;
+
+        state.debugAmplitude = maxAmp;
+
+        if (maxAmp < 0.01) return []; // No meaningful signal
 
         const peaks = [];
-        const fs = state.measuredFPS || 30;
-        const minDist = Math.max(3, Math.floor(fs * 60 / CONFIG.MAX_BPM));
-
-        // Adaptive threshold: use a percentage of the max amplitude in recent data
-        const recentLen = Math.min(signal.length, Math.floor(fs * 4));
-        const recent = signal.slice(-recentLen);
-        const maxAmp = Math.max(...recent.map(Math.abs));
-        const threshold = maxAmp * 0.1; // 10% of max — very permissive
-
-        let lastPeakIdx = -minDist;
+        let lastPeak = -minPeakDist;
 
         for (let i = 1; i < signal.length - 1; i++) {
-            // Simple local maximum: greater than both neighbors
             if (
                 signal[i] > signal[i - 1] &&
-                signal[i] >= signal[i + 1] &&
+                signal[i] > signal[i + 1] &&
                 signal[i] > threshold &&
-                (i - lastPeakIdx) >= minDist
+                (i - lastPeak) >= minPeakDist
             ) {
                 peaks.push(i);
-                lastPeakIdx = i;
+                lastPeak = i;
             }
         }
 
         return peaks;
     }
 
-    function bpmFromPeaks(peaks, timestamps) {
+    /**
+     * Validate that peaks represent a real heartbeat by checking:
+     * 1. Enough peaks
+     * 2. Intervals are consistent (low coefficient of variation)
+     * 3. BPM falls in physiological range
+     */
+    function computeValidBPM(peaks) {
         if (peaks.length < CONFIG.MIN_PEAKS_FOR_BPM) return null;
 
         const intervals = [];
         for (let i = 1; i < peaks.length; i++) {
-            const dt = timestamps[peaks[i]] - timestamps[peaks[i - 1]];
+            const dt = state.timestamps[peaks[i]] - state.timestamps[peaks[i - 1]];
             if (dt > 0) {
                 const bpm = 60000 / dt;
                 if (bpm >= CONFIG.MIN_BPM && bpm <= CONFIG.MAX_BPM) {
@@ -359,235 +350,200 @@
             }
         }
 
-        if (intervals.length < 1) return null;
+        if (intervals.length < 2) return null;
 
-        // Median interval
-        intervals.sort((a, b) => a - b);
-        const median = intervals[Math.floor(intervals.length / 2)];
+        // Check consistency: coefficient of variation should be low
+        const mean = intervals.reduce((a, b) => a + b, 0) / intervals.length;
+        const variance = intervals.reduce((a, b) => a + (b - mean) ** 2, 0) / intervals.length;
+        const cv = Math.sqrt(variance) / mean;
+
+        // If intervals are wildly inconsistent, it's noise not heartbeat
+        if (cv > CONFIG.IBI_CONSISTENCY) return null;
+
+        // Use median for final BPM
+        const sorted = [...intervals].sort((a, b) => a - b);
+        const median = sorted[Math.floor(sorted.length / 2)];
+        const bpm = Math.round(60000 / median);
+
+        if (bpm < CONFIG.MIN_BPM || bpm > CONFIG.MAX_BPM) return null;
+
         state.lastIBI = Math.round(median);
-        return Math.round(60000 / median);
+        state.debugPeakCount = peaks.length;
+
+        return bpm;
     }
 
     // ============================================
-    // BPM Detection — Method 2: Auto-Correlation
+    // Helpers
     // ============================================
-    function bpmFromAutocorrelation(signal) {
-        const fs = state.measuredFPS || 30;
-        const n = signal.length;
-        if (n < fs * 2) return null; // Need at least 2 seconds
-
-        // Use last ~5 seconds of data
-        const len = Math.min(n, Math.floor(fs * 5));
-        const data = signal.slice(-len);
-
-        // Normalize (zero mean, unit variance)
-        const mean = data.reduce((a, b) => a + b, 0) / data.length;
-        const centered = data.map(v => v - mean);
-        const energy = centered.reduce((a, b) => a + b * b, 0);
-        if (energy < 1e-10) return null;
-
-        // Auto-correlation for lags corresponding to 40–220 BPM
-        const minLag = Math.floor(fs * 60 / CONFIG.MAX_BPM); // ~8 samples at 30fps for 220bpm
-        const maxLag = Math.floor(fs * 60 / CONFIG.MIN_BPM);  // ~45 samples at 30fps for 40bpm
-        const safeLag = Math.min(maxLag, centered.length - 1);
-
-        let bestLag = minLag;
-        let bestCorr = -Infinity;
-
-        for (let lag = minLag; lag <= safeLag; lag++) {
-            let corr = 0;
-            const count = centered.length - lag;
-            for (let i = 0; i < count; i++) {
-                corr += centered[i] * centered[i + lag];
-            }
-            corr /= count;
-
-            if (corr > bestCorr) {
-                bestCorr = corr;
-                bestLag = lag;
-            }
-        }
-
-        // The correlation should be positive and meaningful
-        const normalizedCorr = bestCorr / (energy / centered.length);
-        if (normalizedCorr < 0.05) return null; // Too weak
-
-        const bpm = Math.round((fs * 60) / bestLag);
-        if (bpm >= CONFIG.MIN_BPM && bpm <= CONFIG.MAX_BPM) {
-            return bpm;
-        }
-        return null;
+    function getEffectiveFPS() {
+        if (state.timestamps.length < 10) return 30;
+        const recent = state.timestamps.slice(-30);
+        const elapsed = recent[recent.length - 1] - recent[0];
+        if (elapsed <= 0) return 30;
+        return Math.round((recent.length - 1) * 1000 / elapsed);
     }
 
     // ============================================
-    // Main Processing Loop
+    // Main Loop
     // ============================================
     function processFrame() {
         if (!state.isRunning) return;
 
         const now = performance.now();
 
-        // Measure actual FPS
-        state.sampleCount++;
-        const totalElapsed = now - state.startTime;
-        if (totalElapsed > 1000) {
-            state.measuredFPS = Math.round(state.sampleCount / (totalElapsed / 1000));
-        }
-
-        // Throttle: aim for ~30 samples/sec max
-        const minInterval = 1000 / 35;
-        if (now - state.lastSampleTime < minInterval) {
+        // Throttle to ~30fps
+        if (now - state.lastSampleTime < 28) {
             state.animationFrameId = requestAnimationFrame(processFrame);
             return;
         }
         state.lastSampleTime = now;
+        state.sampleCount++;
 
-        // Extract channels
-        const channels = extractChannels();
-        const redValue = channels.red;
+        // 1. Sample camera
+        const channels = sampleRedChannel();
+        if (!channels) {
+            state.animationFrameId = requestAnimationFrame(processFrame);
+            return;
+        }
 
-        // Signal quality
-        state.signalQuality = state.signalQuality * 0.9 + assessSignalQuality(channels) * 0.1;
+        // 2. Check finger detection
+        state.fingerDetected = isFingerOnCamera(channels);
 
-        // Store raw
-        state.rawSignal.push(redValue);
+        // 3. Store raw red value
+        state.rawRed.push(channels.red);
         state.timestamps.push(now);
 
-        // Remove DC component and apply bandpass filter
-        const acComponent = removeDC(redValue);
-        const filtered = bandpassFilter(acComponent);
-        state.filteredSignal.push(filtered);
-
-        // Trim buffers
-        const maxSamples = Math.floor((state.measuredFPS || 30) * CONFIG.BUFFER_SECONDS);
-        while (state.rawSignal.length > maxSamples) {
-            state.rawSignal.shift();
-            state.filteredSignal.shift();
+        // 4. Trim buffers
+        const fps = getEffectiveFPS();
+        const maxSamples = Math.floor(fps * CONFIG.BUFFER_SECONDS);
+        while (state.rawRed.length > maxSamples) {
+            state.rawRed.shift();
             state.timestamps.shift();
         }
 
-        // Process BPM after stabilization
+        // 5. Process signal (detrend + smooth)
+        let processed = null;
+        if (state.rawRed.length > CONFIG.WARMUP_SAMPLES) {
+            processed = processSignal();
+        }
+
+        // 6. Detect BPM
         const timeSinceStart = now - state.startTime;
 
-        if (timeSinceStart > CONFIG.STABILIZATION_TIME && state.filteredSignal.length > 30) {
-            // Smooth the filtered signal
-            const smoothed = smooth(state.filteredSignal, CONFIG.SMOOTHING_WINDOW);
-
-            // Method 1: Peak detection
-            let bpm = null;
-            const peaks = detectPeaks(smoothed);
-            bpm = bpmFromPeaks(peaks, state.timestamps);
-
-            if (bpm !== null) {
-                state.detectionMethod = 'peaks';
-            }
-
-            // Method 2: Auto-correlation fallback
-            if (bpm === null && state.filteredSignal.length > (state.measuredFPS || 30) * 3) {
-                bpm = bpmFromAutocorrelation(state.filteredSignal);
-                if (bpm !== null) {
-                    state.detectionMethod = 'autocorr';
-                    // Estimate IBI from autocorrelation BPM
-                    state.lastIBI = Math.round(60000 / bpm);
-                }
-            }
-
-            if (bpm !== null) {
-                // Sanity check: if we have history, reject outliers (>30% change)
-                if (state.bpmHistory.length >= 3) {
-                    const recentAvg = state.bpmHistory.slice(-3).reduce((a, b) => a + b, 0) / 3;
-                    if (Math.abs(bpm - recentAvg) / recentAvg > 0.35) {
-                        // Skip this reading — likely noise
-                        bpm = null;
-                    }
-                }
-            }
+        if (processed && state.rawRed.length > CONFIG.WARMUP_SAMPLES && state.fingerDetected) {
+            const peaks = findPeaks(processed);
+            const bpm = computeValidBPM(peaks);
 
             if (bpm !== null) {
                 state.bpmHistory.push(bpm);
                 state.allBpmReadings.push(bpm);
+
                 if (state.bpmHistory.length > CONFIG.BPM_HISTORY_SIZE) {
                     state.bpmHistory.shift();
                 }
 
-                // Compute smoothed BPM
+                // Smoothed current BPM
                 state.currentBPM = Math.round(
                     state.bpmHistory.reduce((a, b) => a + b, 0) / state.bpmHistory.length
                 );
 
-                // Track stats from all readings
-                if (state.currentBPM > 0) {
-                    state.minBPM = Math.min(state.minBPM, state.currentBPM);
-                    state.maxBPM = Math.max(state.maxBPM, state.currentBPM);
-                    // True average of all readings
-                    state.avgBPM = Math.round(
-                        state.allBpmReadings.reduce((a, b) => a + b, 0) / state.allBpmReadings.length
-                    );
-                }
+                // Stats
+                state.minBPM = Math.min(state.minBPM, state.currentBPM);
+                state.maxBPM = Math.max(state.maxBPM, state.currentBPM);
+                state.avgBPM = Math.round(
+                    state.allBpmReadings.reduce((a, b) => a + b, 0) / state.allBpmReadings.length
+                );
 
-                // Heartbeat animation — trigger on new peak
+                // Heartbeat animation
                 if (peaks.length > 0) {
                     const lastPeakTs = state.timestamps[peaks[peaks.length - 1]];
-                    if (lastPeakTs > state.lastPeakTime) {
-                        state.lastPeakTime = lastPeakTs;
+                    if (lastPeakTs > state.lastBeatTime + 250) { // debounce 250ms
+                        state.lastBeatTime = lastPeakTs;
                         triggerHeartbeat();
                     }
                 }
             }
         }
 
-        // Update UI
-        updateUI(timeSinceStart);
+        // 7. Signal quality (smoothed)
+        const rawQuality = computeSignalQuality();
+        state.signalQuality = state.signalQuality * 0.85 + rawQuality * 0.15;
 
-        // Draw waveform
+        // 8. Update UI + draw waveform
+        updateUI(timeSinceStart);
         drawWaveform();
 
         state.animationFrameId = requestAnimationFrame(processFrame);
     }
 
+    function computeSignalQuality() {
+        if (!state.fingerDetected) return 0.05;
+
+        let q = 0.3; // Base quality for having finger detected
+
+        // Amplitude of AC component
+        if (state.debugAmplitude > 0.05) {
+            q += Math.min(0.3, state.debugAmplitude * 2);
+        }
+
+        // Consistent BPM readings
+        if (state.bpmHistory.length >= 3) {
+            const recent = state.bpmHistory.slice(-3);
+            const mean = recent.reduce((a, b) => a + b, 0) / recent.length;
+            const spread = Math.max(...recent) - Math.min(...recent);
+            if (spread / mean < 0.1) {
+                q += 0.4; // Very consistent
+            } else if (spread / mean < 0.2) {
+                q += 0.2;
+            }
+        }
+
+        return Math.min(1, q);
+    }
+
     // ============================================
-    // UI Updates
+    // UI
     // ============================================
     function updateUI(timeSinceStart) {
         const timeSeconds = Math.floor(timeSinceStart / 1000);
         DOM.waveformTime.textContent = `${timeSeconds}s`;
 
-        // Signal quality display
-        const qualityPct = Math.round(state.signalQuality * 100);
-        DOM.sqBarFill.style.width = `${qualityPct}%`;
+        // Signal quality bar
+        const qPct = Math.round(state.signalQuality * 100);
+        DOM.sqBarFill.style.width = `${qPct}%`;
 
         const sq = DOM.sqValue;
-        if (state.signalQuality > 0.55) {
+        if (!state.fingerDetected) {
+            sq.textContent = 'No finger detected';
+            sq.className = 'sq-value poor';
+        } else if (state.signalQuality > 0.6) {
             sq.textContent = 'Excellent';
             sq.className = 'sq-value good';
-        } else if (state.signalQuality > 0.25) {
+        } else if (state.signalQuality > 0.3) {
             sq.textContent = 'Good';
             sq.className = 'sq-value fair';
-        } else if (state.signalQuality > 0.1) {
-            sq.textContent = 'Weak — Hold steady';
-            sq.className = 'sq-value poor';
         } else {
-            sq.textContent = 'Place finger on lens';
+            sq.textContent = 'Hold steady...';
             sq.className = 'sq-value poor';
         }
 
-        // BPM display
-        if (state.currentBPM > 0) {
+        // BPM
+        if (state.currentBPM > 0 && state.fingerDetected) {
             DOM.bpmValue.textContent = state.currentBPM;
-            const methodLabel = state.detectionMethod === 'autocorr' ? 'Estimated' : 'Stable reading';
-            DOM.bpmLabel.textContent = methodLabel;
+            DOM.bpmLabel.textContent = state.signalQuality > 0.5 ? 'Stable reading' : 'Measuring...';
             DOM.bpmLabel.className = 'bpm-label stable';
-        } else if (timeSinceStart < CONFIG.STABILIZATION_TIME) {
+        } else if (!state.fingerDetected) {
+            DOM.bpmValue.textContent = '--';
+            DOM.bpmLabel.textContent = 'Cover camera with fingertip';
+            DOM.bpmLabel.className = 'bpm-label';
+        } else if (state.rawRed.length < CONFIG.WARMUP_SAMPLES) {
             DOM.bpmValue.textContent = '--';
             DOM.bpmLabel.textContent = 'Calibrating...';
             DOM.bpmLabel.className = 'bpm-label';
-        } else if (state.signalQuality < 0.1) {
-            DOM.bpmValue.textContent = '--';
-            DOM.bpmLabel.textContent = 'Cover the camera with your finger';
-            DOM.bpmLabel.className = 'bpm-label';
         } else {
             DOM.bpmValue.textContent = '--';
-            DOM.bpmLabel.textContent = 'Analyzing signal...';
+            DOM.bpmLabel.textContent = 'Analyzing... hold still';
             DOM.bpmLabel.className = 'bpm-label';
         }
 
@@ -605,26 +561,27 @@
     }
 
     // ============================================
-    // Waveform Rendering
+    // Waveform
     // ============================================
     function drawWaveform() {
         const canvas = DOM.waveformCanvas;
         const dpr = window.devicePixelRatio || 1;
         const rect = canvas.getBoundingClientRect();
 
-        if (canvas.width !== Math.round(rect.width * dpr) || canvas.height !== Math.round(rect.height * dpr)) {
-            canvas.width = Math.round(rect.width * dpr);
-            canvas.height = Math.round(rect.height * dpr);
+        const cw = Math.round(rect.width * dpr);
+        const ch = Math.round(rect.height * dpr);
+        if (canvas.width !== cw || canvas.height !== ch) {
+            canvas.width = cw;
+            canvas.height = ch;
             waveCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
         }
 
         const w = rect.width;
         const h = rect.height;
-
         waveCtx.clearRect(0, 0, w, h);
 
         // Grid
-        waveCtx.strokeStyle = 'rgba(255, 255, 255, 0.04)';
+        waveCtx.strokeStyle = 'rgba(255,255,255,0.04)';
         waveCtx.lineWidth = 1;
         for (let i = 1; i < 4; i++) {
             waveCtx.beginPath();
@@ -632,42 +589,40 @@
             waveCtx.lineTo(w, (h / 4) * i);
             waveCtx.stroke();
         }
-
-        // Center line
-        waveCtx.strokeStyle = 'rgba(255, 255, 255, 0.08)';
+        waveCtx.strokeStyle = 'rgba(255,255,255,0.08)';
         waveCtx.beginPath();
         waveCtx.moveTo(0, h / 2);
         waveCtx.lineTo(w, h / 2);
         waveCtx.stroke();
 
-        const signal = state.filteredSignal;
-        if (signal.length < 3) return;
+        const signal = state.detrendedSignal;
+        if (!signal || signal.length < 3) return;
 
-        // Show last ~5 seconds
-        const fs = state.measuredFPS || 30;
-        const displaySamples = Math.min(signal.length, Math.floor(fs * 5));
-        const displayData = signal.slice(-displaySamples);
+        // Show last 5 seconds
+        const fps = getEffectiveFPS();
+        const displayN = Math.min(signal.length, Math.floor(fps * 5));
+        const displayData = signal.slice(-displayN);
 
-        // Auto-scale with padding
-        let maxVal = -Infinity, minVal = Infinity;
+        // Auto-scale
+        let yMin = Infinity, yMax = -Infinity;
         for (const v of displayData) {
-            if (v > maxVal) maxVal = v;
-            if (v < minVal) minVal = v;
+            if (v < yMin) yMin = v;
+            if (v > yMax) yMax = v;
         }
-        const range = (maxVal - minVal) || 1;
+        const range = (yMax - yMin) || 1;
         const pad = 0.12;
-        const yScale = h * (1 - 2 * pad) / range;
-        const yOffset = h * pad - minVal * yScale;
 
-        // Helper to map data point to canvas Y
-        const toY = (val) => h - (val * yScale + yOffset);
-        const toX = (i) => (i / (displaySamples - 1)) * w;
+        const toX = (i) => (i / Math.max(1, displayN - 1)) * w;
+        const toY = (v) => {
+            const normalized = (v - yMin) / range;  // 0..1
+            return h * (1 - pad) - normalized * h * (1 - 2 * pad);
+        };
 
-        // --- Filled area ---
+        // Filled area
         const fillGrad = waveCtx.createLinearGradient(0, 0, 0, h);
-        fillGrad.addColorStop(0, 'rgba(0, 212, 216, 0.18)');
-        fillGrad.addColorStop(0.5, 'rgba(0, 212, 216, 0.05)');
-        fillGrad.addColorStop(1, 'rgba(0, 212, 216, 0.0)');
+        fillGrad.addColorStop(0, 'rgba(0,212,216,0.18)');
+        fillGrad.addColorStop(0.5, 'rgba(0,212,216,0.05)');
+        fillGrad.addColorStop(1, 'rgba(0,212,216,0.0)');
 
         waveCtx.beginPath();
         waveCtx.moveTo(toX(0), h);
@@ -677,13 +632,12 @@
             const cy = (toY(displayData[i - 1]) + toY(displayData[i])) / 2;
             waveCtx.quadraticCurveTo(toX(i - 1), toY(displayData[i - 1]), cx, cy);
         }
-        waveCtx.lineTo(toX(displayData.length - 1), toY(displayData[displayData.length - 1]));
         waveCtx.lineTo(toX(displayData.length - 1), h);
         waveCtx.closePath();
         waveCtx.fillStyle = fillGrad;
         waveCtx.fill();
 
-        // --- Waveform stroke ---
+        // Line
         waveCtx.beginPath();
         waveCtx.moveTo(toX(0), toY(displayData[0]));
         for (let i = 1; i < displayData.length; i++) {
@@ -693,30 +647,27 @@
         }
 
         const strokeGrad = waveCtx.createLinearGradient(0, 0, w, 0);
-        strokeGrad.addColorStop(0, 'rgba(0, 212, 216, 0.25)');
-        strokeGrad.addColorStop(0.6, 'rgba(0, 212, 216, 0.85)');
-        strokeGrad.addColorStop(1, 'rgba(0, 212, 216, 1)');
-
+        strokeGrad.addColorStop(0, 'rgba(0,212,216,0.25)');
+        strokeGrad.addColorStop(0.6, 'rgba(0,212,216,0.85)');
+        strokeGrad.addColorStop(1, 'rgba(0,212,216,1)');
         waveCtx.strokeStyle = strokeGrad;
         waveCtx.lineWidth = 2.2;
         waveCtx.lineJoin = 'round';
         waveCtx.lineCap = 'round';
         waveCtx.stroke();
 
-        // --- Glow dot at end ---
-        const endX = toX(displayData.length - 1);
-        const endY = toY(displayData[displayData.length - 1]);
-
-        const glowGrad = waveCtx.createRadialGradient(endX, endY, 0, endX, endY, 10);
-        glowGrad.addColorStop(0, 'rgba(0, 212, 216, 0.7)');
-        glowGrad.addColorStop(1, 'rgba(0, 212, 216, 0)');
+        // End dot with glow
+        const ex = toX(displayData.length - 1);
+        const ey = toY(displayData[displayData.length - 1]);
+        const glow = waveCtx.createRadialGradient(ex, ey, 0, ex, ey, 10);
+        glow.addColorStop(0, 'rgba(0,212,216,0.7)');
+        glow.addColorStop(1, 'rgba(0,212,216,0)');
         waveCtx.beginPath();
-        waveCtx.arc(endX, endY, 10, 0, Math.PI * 2);
-        waveCtx.fillStyle = glowGrad;
+        waveCtx.arc(ex, ey, 10, 0, Math.PI * 2);
+        waveCtx.fillStyle = glow;
         waveCtx.fill();
-
         waveCtx.beginPath();
-        waveCtx.arc(endX, endY, 3, 0, Math.PI * 2);
+        waveCtx.arc(ex, ey, 3, 0, Math.PI * 2);
         waveCtx.fillStyle = '#00d4d8';
         waveCtx.fill();
     }
@@ -726,98 +677,83 @@
     // ============================================
     async function startMeasurement() {
         DOM.btnStart.disabled = true;
-        DOM.btnStart.textContent = 'Starting...';
 
         const success = await startCamera();
         if (!success) {
             DOM.btnStart.disabled = false;
-            DOM.btnStart.textContent = 'Start Measurement';
             return;
         }
 
-        // Reset all state
-        state.isRunning = true;
-        state.startTime = performance.now();
-        state.lastSampleTime = 0;
-        state.sampleCount = 0;
-        state.measuredFPS = 30;
-        state.rawSignal = [];
-        state.filteredSignal = [];
-        state.timestamps = [];
-        state.bpmHistory = [];
-        state.allBpmReadings = [];
-        state.currentBPM = 0;
-        state.avgBPM = 0;
-        state.minBPM = Infinity;
-        state.maxBPM = 0;
-        state.lastIBI = 0;
-        state.signalQuality = 0;
-        state.lastPeakTime = 0;
-        state.detectionMethod = '';
-        state.dcEstimate = 0;
-        state.lpX = [0, 0, 0];
-        state.lpY = [0, 0, 0];
-        state.hpX = [0, 0, 0];
-        state.hpY = [0, 0, 0];
+        // Reset state
+        Object.assign(state, {
+            isRunning: true,
+            startTime: performance.now(),
+            lastSampleTime: 0,
+            sampleCount: 0,
+            rawRed: [],
+            timestamps: [],
+            detrendedSignal: [],
+            bpmHistory: [],
+            allBpmReadings: [],
+            currentBPM: 0,
+            avgBPM: 0,
+            minBPM: Infinity,
+            maxBPM: 0,
+            lastIBI: 0,
+            signalQuality: 0,
+            lastBeatTime: 0,
+            fingerDetected: false,
+            debugRedMean: 0,
+            debugRedRatio: 0,
+            debugPeakCount: 0,
+            debugAmplitude: 0,
+        });
 
-        // Swap views
         DOM.instructionCard.style.display = 'none';
         DOM.measurementPanel.style.display = 'flex';
-
-        // Reset displays
         DOM.bpmValue.textContent = '--';
         DOM.bpmLabel.textContent = 'Calibrating...';
         DOM.bpmLabel.className = 'bpm-label';
         DOM.sqBarFill.style.width = '0%';
         DOM.sqValue.textContent = 'Waiting...';
         DOM.sqValue.className = 'sq-value';
-
         DOM.btnStart.disabled = false;
-        DOM.btnStart.innerHTML = `
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20">
-                <circle cx="12" cy="12" r="10"/>
-                <polygon points="10,8 16,12 10,16" fill="currentColor" stroke="none"/>
-            </svg>
-            Start Measurement`;
 
         state.animationFrameId = requestAnimationFrame(processFrame);
+        console.log('[PulseSense] Measurement started');
     }
 
     function stopMeasurement() {
         state.isRunning = false;
-
         if (state.animationFrameId) {
             cancelAnimationFrame(state.animationFrameId);
             state.animationFrameId = null;
         }
-
         stopCamera();
 
         DOM.measurementPanel.style.display = 'none';
         DOM.instructionCard.style.display = '';
-
         DOM.instructionCard.style.animation = 'none';
         void DOM.instructionCard.offsetWidth;
         DOM.instructionCard.style.animation = '';
+
+        console.log('[PulseSense] Measurement stopped');
     }
 
     // ============================================
-    // Event Listeners
+    // Events
     // ============================================
     DOM.btnStart.addEventListener('click', startMeasurement);
     DOM.btnStop.addEventListener('click', stopMeasurement);
 
     document.addEventListener('visibilitychange', () => {
-        if (document.hidden && state.isRunning) {
-            stopMeasurement();
-        }
+        if (document.hidden && state.isRunning) stopMeasurement();
     });
 
     window.addEventListener('resize', () => {
         if (state.isRunning) drawWaveform();
     });
 
-    // Log for debugging
-    console.log('PulseSense initialized. Click "Start Measurement" to begin.');
+    console.log('[PulseSense] Ready. Tap "Start Measurement" to begin.');
 
 })();
