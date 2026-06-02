@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <meta name="description" content="Measure your heart rate in real-time using your phone camera and flashlight. Based on photoplethysmography (PPG) technology.">
+    <title>PulseSense — Camera Heart Rate Monitor</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Ambient background effects -->
+        <div class="ambient-orb orb-1"></div>
+        <div class="ambient-orb orb-2"></div>
+        <div class="ambient-orb orb-3"></div>
+
+        <!-- Header -->
+        <header class="app-header" id="app-header">
+            <div class="logo">
+                <svg class="logo-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/>
+                </svg>
+                <h1>PulseSense</h1>
+            </div>
+            <p class="tagline">Camera-based heart rate monitor</p>
+        </header>
+
+        <!-- Main Content -->
+        <main class="main-content">
+
+            <!-- Instruction Card (shown before measurement) -->
+            <section class="instruction-card glass-card" id="instruction-card">
+                <div class="instruction-icon">
+                    <svg viewBox="0 0 64 64" fill="none">
+                        <circle cx="32" cy="32" r="28" stroke="url(#grad1)" stroke-width="2" stroke-dasharray="4 4"/>
+                        <circle cx="32" cy="32" r="18" fill="url(#grad2)" opacity="0.3"/>
+                        <path d="M32 22 C28 22 20 28 20 34 C20 42 32 48 32 48 C32 48 44 42 44 34 C44 28 36 22 32 22Z" fill="url(#grad2)"/>
+                        <defs>
+                            <linearGradient id="grad1" x1="0" y1="0" x2="64" y2="64">
+                                <stop offset="0%" stop-color="#ff4757"/>
+                                <stop offset="100%" stop-color="#ff6b81"/>
+                            </linearGradient>
+                            <linearGradient id="grad2" x1="0" y1="0" x2="64" y2="64">
+                                <stop offset="0%" stop-color="#ff4757"/>
+                                <stop offset="100%" stop-color="#ff6b81"/>
+                            </linearGradient>
+                        </defs>
+                    </svg>
+                </div>
+                <h2>How to measure</h2>
+                <ol class="instructions-list">
+                    <li>
+                        <span class="step-num">1</span>
+                        <span>Tap <strong>"Start Measurement"</strong> to activate the camera &amp; flash</span>
+                    </li>
+                    <li>
+                        <span class="step-num">2</span>
+                        <span>Gently place your <strong>fingertip</strong> over the rear camera lens</span>
+                    </li>
+                    <li>
+                        <span class="step-num">3</span>
+                        <span>Hold still for <strong>10–15 seconds</strong> until a stable reading appears</span>
+                    </li>
+                </ol>
+                <button class="btn-primary" id="btn-start">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20">
+                        <circle cx="12" cy="12" r="10"/>
+                        <polygon points="10,8 16,12 10,16" fill="currentColor" stroke="none"/>
+                    </svg>
+                    Start Measurement
+                </button>
+                <p class="disclaimer">⚕️ For informational purposes only. Not a medical device.</p>
+            </section>
+
+            <!-- Measurement Panel (shown during measurement) -->
+            <section class="measurement-panel" id="measurement-panel" style="display: none;">
+
+                <!-- BPM Display -->
+                <div class="bpm-display glass-card" id="bpm-card">
+                    <div class="bpm-heart" id="bpm-heart">
+                        <svg viewBox="0 0 24 24" fill="currentColor">
+                            <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/>
+                        </svg>
+                    </div>
+                    <div class="bpm-value-container">
+                        <span class="bpm-value" id="bpm-value">--</span>
+                        <span class="bpm-unit">BPM</span>
+                    </div>
+                    <div class="bpm-label" id="bpm-label">Analyzing...</div>
+                </div>
+
+                <!-- Signal Quality -->
+                <div class="signal-quality glass-card" id="signal-quality-card">
+                    <div class="sq-header">
+                        <span class="sq-label">Signal Quality</span>
+                        <span class="sq-value" id="sq-value">Waiting...</span>
+                    </div>
+                    <div class="sq-bar-track">
+                        <div class="sq-bar-fill" id="sq-bar-fill"></div>
+                    </div>
+                </div>
+
+                <!-- Stats Row -->
+                <div class="stats-row">
+                    <div class="stat-card glass-card">
+                        <span class="stat-label">Avg BPM</span>
+                        <span class="stat-value" id="stat-avg">--</span>
+                    </div>
+                    <div class="stat-card glass-card">
+                        <span class="stat-label">Min</span>
+                        <span class="stat-value" id="stat-min">--</span>
+                    </div>
+                    <div class="stat-card glass-card">
+                        <span class="stat-label">Max</span>
+                        <span class="stat-value" id="stat-max">--</span>
+                    </div>
+                    <div class="stat-card glass-card">
+                        <span class="stat-label">IBI (ms)</span>
+                        <span class="stat-value" id="stat-ibi">--</span>
+                    </div>
+                </div>
+
+                <!-- Waveform -->
+                <div class="waveform-container glass-card" id="waveform-card">
+                    <div class="waveform-header">
+                        <span class="waveform-title">PPG Waveform</span>
+                        <span class="waveform-time" id="waveform-time">0s</span>
+                    </div>
+                    <canvas id="waveform-canvas"></canvas>
+                </div>
+
+                <!-- Camera Preview (small, for debugging) -->
+                <div class="camera-preview" id="camera-preview">
+                    <video id="camera-video" autoplay playsinline muted></video>
+                    <canvas id="camera-canvas" style="display:none;"></canvas>
+                    <div class="preview-label">Camera Feed</div>
+                </div>
+
+                <!-- Stop button -->
+                <button class="btn-stop" id="btn-stop">
+                    <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18">
+                        <rect x="6" y="6" width="12" height="12" rx="2"/>
+                    </svg>
+                    Stop Measurement
+                </button>
+            </section>
+
+        </main>
+
+        <!-- Footer -->
+        <footer class="app-footer">
+            <p>Built with PPG (Photoplethysmography) technology</p>
+        </footer>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
